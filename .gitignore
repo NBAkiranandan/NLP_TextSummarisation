@@ -1,0 +1,13 @@
+# Large local datasets and experiment outputs
+*.csv
+*.ipynb
+
+# Python and Streamlit local files
+__pycache__/
+*.py[cod]
+.streamlit/secrets.toml
+.venv/
+venv/
+
+# Editor files
+.vscode/
