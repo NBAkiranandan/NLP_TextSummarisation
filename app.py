@@ -11,6 +11,8 @@ from nltk.tokenize import sent_tokenize
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from statistics_page import render_statistics_page
+
 
 st.set_page_config(page_title="SmartBrief | NLP Summarizer", page_icon="📝", layout="wide")
 
@@ -95,12 +97,15 @@ def summarize(text: str, method: str, ratio: float) -> Tuple[str, List[str], np.
     sentences = tokenize_sentences(text)
     if not sentences:
         return "", [], np.array([]), []
-    if len(sentences) <= 2:
-        return " ".join(sentences), sentences, np.ones(len(sentences)), list(range(len(sentences)))
     processed = [clean_sentence(sentence) for sentence in sentences]
-    scores = (tfidf_scores(processed) if method == "TF-IDF" else
-              weighted_tfidf_scores(processed) if method == "Weighted TF-IDF" else
-              textrank_scores(processed))
+    scorers = {
+        "TF-IDF": tfidf_scores,
+        "Weighted TF-IDF": weighted_tfidf_scores,
+        "TextRank": textrank_scores,
+    }
+    if method not in scorers:
+        raise ValueError(f"Unsupported summarization method: {method}")
+    scores = scorers[method](processed)
     selected = sorted(np.argsort(scores)[-requested_count(len(sentences), ratio):].tolist())
     return " ".join(sentences[index] for index in selected), sentences, scores, selected
 
@@ -115,6 +120,18 @@ DEMO_TEXT = """Artificial intelligence is changing how organisations process inf
 
 
 setup_tokenizer()
+
+with st.sidebar:
+    page = st.radio("Navigate", ["Summarizer", "Summarized Statistics"])
+
+if page == "Summarized Statistics":
+    render_statistics_page(
+        st.session_state.get("document", ""),
+        summarize,
+        tokenize_sentences,
+    )
+    st.stop()
+
 st.title("📝 SmartBrief: NLP Text Summarization System")
 st.caption("An extractive NLP system that converts long articles or documents into concise, readable summaries.")
 
@@ -139,23 +156,29 @@ text = st.text_area("Paste an article or document", value=st.session_state.get("
 settings, explanation = st.columns([2, 1])
 with settings:
     method = st.selectbox("Sentence-scoring method", ["TF-IDF", "Weighted TF-IDF", "TextRank"])
-    label = st.select_slider("Summary length", options=["Short", "Medium", "Long"], value="Medium")
+    label = st.select_slider("Summary length", options=["Low", "Medium", "High"], value="Medium")
 with explanation:
     descriptions = {"TF-IDF": "Scores sentences containing distinctive, informative terms.",
                     "Weighted TF-IDF": "Combines TF-IDF, position, length, and repeated keywords.",
                     "TextRank": "Ranks sentences by similarity using a PageRank-style graph."}
     st.info(descriptions[method])
 
-ratio = {"Short": 0.20, "Medium": 0.30, "Long": 0.40}[label]
-if st.button("Generate summary", type="primary", use_container_width=True):
+ratio = {"Low": 0.20, "Medium": 0.30, "High": 0.40}[label]
+generate_clicked = st.button("Generate summary", type="primary", use_container_width=True)
+current_config = (text, method, ratio)
+if generate_clicked or st.session_state.get("result_config") != current_config:
     if len(tokenize_sentences(text)) < 2:
-        st.warning("Please provide at least two complete sentences to summarize.")
+        st.session_state.pop("result", None)
+        st.session_state.pop("result_config", None)
+        if generate_clicked:
+            st.warning("Please provide at least two complete sentences to summarize.")
     else:
         with st.spinner("Tokenizing and ranking important sentences…"):
             summary, sentences, scores, selected = summarize(text, method, ratio)
         st.session_state.result = (summary, sentences, scores, selected, method)
+        st.session_state.result_config = current_config
 
-if "result" in st.session_state:
+if st.session_state.get("result_config") == current_config and "result" in st.session_state:
     summary, sentences, scores, selected, used_method = st.session_state.result
     st.divider()
     st.subheader("Generated summary")
