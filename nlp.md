@@ -29,7 +29,9 @@ streamlit run app.py
 
 Open the local URL shown in the terminal. For a quick presentation, select **Load demo article** and choose a method. Choose a **Low**, **Medium**, or **High** summary length; the summary is regenerated when the method, document, or summary length changes. Click **Generate summary** to rerun it with the current settings. Expand **Show important sentence extraction** to demonstrate the selected method's scoring stage.
 
-Use **Summarized Statistics** in the sidebar to open the academic dashboard. Its length and compression distributions are calculated from the complete `test.csv` held-out dataset (article text and reference highlights). The grouped ROUGE chart evaluates the app's three existing methods against a reproducible 100-record sample from `validation.csv` (`random_state=42`), matching the evaluation split used in `pipeline.py`; it uses ROUGE-1, ROUGE-2, and ROUGE-L F-measures. The current-article recommendation compares the mean sentence-ranking scores of the sentences selected by each method; this is an input-specific salience proxy, not a reference-based ROUGE score.
+Use **Summarized Statistics** in the sidebar to open the academic dashboard. Its length and compression distributions are calculated from the complete `test.csv` held-out dataset (article text and reference highlights). The grouped ROUGE chart evaluates the app's three existing methods against a reproducible 100-record sample from `validation.csv` (`random_state=42`), matching the evaluation split used by `pipeline.py`; it uses ROUGE-1, ROUGE-2, and ROUGE-L F-measures. The current-article recommendation compares the mean sentence-ranking scores of the sentences selected by each method; this is an input-specific salience proxy, not a reference-based ROUGE score.
+
+The analysis pipeline remains runnable with `python pipeline.py`. Its sequential stages are separated into `pipeline_steps/` to make data exploration, preprocessing, scoring/evaluation, weight optimization, and TextRank easier to inspect and modify.
 
 ## Suggested viva explanation
 
