@@ -1,8 +1,10 @@
 """Dataset statistics and method comparisons for the Streamlit app."""
 
 import csv
+import hashlib
 import math
 import os
+import random
 import statistics
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple
@@ -22,6 +24,16 @@ ROUGE_LABELS = {
 SUMMARY_RATIO = 0.30
 EVALUATION_SAMPLE_SIZE = 100
 EVALUATION_RANDOM_STATE = 42
+
+
+def _record_digest(*values: str) -> bytes:
+    """Create an unambiguous compact key for deduplication and overlap checks."""
+    digest = hashlib.blake2b(digest_size=20)
+    for value in values:
+        encoded = value.encode("utf-8", errors="replace")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.digest()
 
 
 @st.cache_data(show_spinner=False)
@@ -51,10 +63,13 @@ def _load_dataset_statistics(
 
 
 @st.cache_data(show_spinner=False)
-def _load_validation_sample(
-    dataset_path: str, modified_ns: int
+def _load_dataset_sample(
+    dataset_path: str,
+    modified_ns: int,
+    sample_size: int = EVALUATION_SAMPLE_SIZE,
+    random_state: int = EVALUATION_RANDOM_STATE,
 ) -> List[Tuple[str, str]]:
-    """Select the reproducible validation sample used by the project pipeline."""
+    """Select a reproducible sample uniformly from a CSV dataset."""
     with open(dataset_path, encoding="utf-8-sig", newline="") as dataset_file:
         record_count = sum(1 for _ in csv.DictReader(dataset_file))
 
@@ -62,9 +77,9 @@ def _load_validation_sample(
         return []
 
     sample_indices = set(
-        np.random.RandomState(EVALUATION_RANDOM_STATE).choice(
+        np.random.RandomState(random_state).choice(
             record_count,
-            size=min(EVALUATION_SAMPLE_SIZE, record_count),
+            size=min(sample_size, record_count),
             replace=False,
         ).tolist()
     )
@@ -80,6 +95,59 @@ def _load_validation_sample(
                 )
 
     return evaluation_records
+
+
+@st.cache_data(show_spinner=False)
+def _load_clean_training_sample(
+    train_path: str,
+    validation_path: str,
+    train_modified_ns: int,
+    validation_modified_ns: int,
+    sample_size: int = EVALUATION_SAMPLE_SIZE,
+    random_state: int = EVALUATION_RANDOM_STATE,
+) -> Tuple[List[Tuple[str, str]], int]:
+    """Reservoir-sample cleaned training records without loading the CSV in memory."""
+    validation_articles = set()
+    with open(validation_path, encoding="utf-8-sig", newline="") as dataset_file:
+        for row in csv.DictReader(dataset_file):
+            article = row.get("article") or ""
+            validation_articles.add(_record_digest(article))
+
+    seen_pairs = set()
+    sample: List[Tuple[str, str]] = []
+    eligible_count = 0
+    rng = random.Random(random_state)
+
+    with open(train_path, encoding="utf-8-sig", newline="") as dataset_file:
+        for row in csv.DictReader(dataset_file):
+            article = row.get("article") or ""
+            highlights = row.get("highlights") or ""
+            article_words = len(article.split())
+            if not article_words:
+                continue
+
+            pair_digest = _record_digest(article, highlights)
+            if pair_digest in seen_pairs:
+                continue
+            seen_pairs.add(pair_digest)
+
+            if _record_digest(article) in validation_articles:
+                continue
+
+            highlight_words = len(highlights.split())
+            if highlight_words / article_words > 1:
+                continue
+
+            eligible_count += 1
+            record = (article, highlights)
+            if len(sample) < sample_size:
+                sample.append(record)
+            else:
+                replacement = rng.randrange(eligible_count)
+                if replacement < sample_size:
+                    sample[replacement] = record
+
+    return sample, eligible_count
 
 
 @st.cache_data(show_spinner=False)
@@ -124,11 +192,46 @@ def _evaluate_methods(
 
 
 def _histogram_data(values: List[float], bin_count: int) -> Dict[str, List]:
-    counts, edges = np.histogram(values, bins=bin_count)
-    labels = [
-        f"{start:,.2f}–{end:,.2f}"
-        for start, end in zip(edges[:-1], edges[1:])
-    ]
+    observations = np.asarray(values, dtype=float)
+    observations = observations[np.isfinite(observations)]
+    if not len(observations):
+        return {"Range": [], "Count": []}
+
+    zero_count = int(np.count_nonzero(observations == 0))
+    positive_values = observations[observations > 0]
+    use_log_bins = (
+        len(positive_values) > 1
+        and positive_values.max() / positive_values.min() >= 20
+    )
+
+    if use_log_bins:
+        edges = np.geomspace(
+            positive_values.min(), positive_values.max(), bin_count + 1
+        )
+        counts, edges = np.histogram(positive_values, bins=edges)
+        labels = ["0"] if zero_count else []
+        if zero_count:
+            counts = np.insert(counts, 0, zero_count)
+        labels.extend(
+            f"{start:,.2g}–{end:,.2g}"
+            for start, end in zip(edges[:-1], edges[1:])
+        )
+    else:
+        minimum = observations.min()
+        maximum = observations.max()
+        if minimum == maximum:
+            padding = max(abs(minimum) * 0.01, 0.5)
+            edges = np.linspace(
+                minimum - padding, maximum + padding, bin_count + 1
+            )
+        else:
+            edges = np.linspace(minimum, maximum, bin_count + 1)
+        counts, edges = np.histogram(observations, bins=edges)
+        labels = [
+            f"{start:,.2f}–{end:,.2f}"
+            for start, end in zip(edges[:-1], edges[1:])
+        ]
+
     return {"Range": labels, "Count": counts.tolist()}
 
 
@@ -144,7 +247,13 @@ def _distribution_chart(
         st.info("At least two dataset observations are required to draw this distribution.")
         return
 
-    bins = min(20, max(5, round(math.sqrt(len(values)))))
+    bins = min(30, max(10, round(math.sqrt(len(values)))))
+    finite_values = [value for value in values if math.isfinite(value)]
+    positive_values = [value for value in finite_values if value > 0]
+    uses_log_bins = (
+        len(positive_values) > 1
+        and max(positive_values) / min(positive_values) >= 20
+    )
     st.bar_chart(
         _histogram_data(values, bins),
         x="Range",
@@ -153,7 +262,13 @@ def _distribution_chart(
         y_label=y_label,
         height=320,
     )
-    st.caption(description)
+    bin_note = (
+        " Log-spaced bins are used to spread out a highly skewed range; "
+        "zero values are shown separately."
+        if uses_log_bins
+        else " Equal-width bins are used."
+    )
+    st.caption(description + bin_note)
 
 
 def _article_method_comparison(
@@ -264,6 +379,80 @@ def _article_method_comparison(
             )
 
 
+def _render_split_comparison(
+    training_rows: List[Dict[str, float]],
+    test_rows: List[Dict[str, float]],
+    training_sample_size: int,
+    test_sample_size: int,
+    training_evaluated: int,
+    test_evaluated: int,
+    cleaned_training_count: int,
+) -> None:
+    """Show comparable sample-level scores and test-minus-training differences."""
+    st.caption(
+        f"From {cleaned_training_count:,} cleaned training records, a "
+        f"reproducible sample of {training_sample_size} was compared with "
+        f"{test_sample_size} test records. ROUGE was calculated for "
+        f"{training_evaluated} eligible training articles and "
+        f"{test_evaluated} eligible test articles."
+    )
+    st.info(
+        "These are split-based evaluation scores for the app's fixed "
+        "extractive methods, not model training results: the methods do not "
+        "fit parameters on the training split. Training-split ROUGE is not "
+        "an independent measure of generalization; the test split is held out."
+    )
+
+    training_by_method = {row["Method"]: row for row in training_rows}
+    test_by_method = {row["Method"]: row for row in test_rows}
+    difference_rows = []
+
+    for metric in ROUGE_METRICS:
+        label = ROUGE_LABELS[metric]
+        chart_data = {"Method": [], "Split": [], "Score": []}
+        for method in METHODS:
+            chart_data["Method"].extend([method, method])
+            chart_data["Split"].extend(["Training", "Test"])
+            chart_data["Score"].extend(
+                [
+                    training_by_method[method][label],
+                    test_by_method[method][label],
+                ]
+            )
+        st.subheader(f"{label}: training vs test sample")
+        st.bar_chart(
+            chart_data,
+            x="Method",
+            y="Score",
+            color="Split",
+            stack=False,
+            x_label="Extractive Method",
+            y_label=f"{label} F-measure",
+            height=300,
+        )
+
+    for method in METHODS:
+        row: Dict[str, object] = {"Method": method}
+        for metric in ROUGE_METRICS:
+            label = ROUGE_LABELS[metric]
+            training_score = training_by_method[method][label]
+            test_score = test_by_method[method][label]
+            row[f"Training {label}"] = round(training_score, 4)
+            row[f"Test {label}"] = round(test_score, 4)
+            row[f"Test - Train {label}"] = round(
+                test_score - training_score, 4
+            )
+        difference_rows.append(row)
+
+    st.subheader("Test-minus-training score differences")
+    st.dataframe(difference_rows, hide_index=True, width="stretch")
+    st.caption(
+        "A positive Test - Train difference means the sample's test ROUGE "
+        "score is higher; a negative value means it is lower. Differences "
+        "describe these samples and are not statistical significance tests."
+    )
+
+
 def render_statistics_page(
     current_article: str,
     summarize: Callable,
@@ -278,6 +467,7 @@ def render_statistics_page(
 
     dataset_path = Path(__file__).with_name("test.csv")
     validation_path = Path(__file__).with_name("validation.csv")
+    train_path = Path(__file__).with_name("train.csv")
     if not dataset_path.is_file():
         st.error(
             "The held-out dataset file test.csv was not found beside the app. "
@@ -300,7 +490,7 @@ def render_statistics_page(
         )
         if validation_path.is_file():
             validation_mtime = os.stat(validation_path).st_mtime_ns
-            evaluation_records = _load_validation_sample(
+            evaluation_records = _load_dataset_sample(
                 str(validation_path), validation_mtime
             )
         else:
@@ -448,6 +638,80 @@ def render_statistics_page(
         )
         st.dataframe(rouge_rows, hide_index=True, width="stretch")
 
+    st.divider()
+    st.subheader("Training-split vs held-out test-split evaluation")
+    st.caption(
+        "Run a separate, reproducible sample comparison for the existing "
+        "extractive methods. This does not change how the summarizer works."
+    )
+    if not train_path.is_file() or not validation_path.is_file():
+        st.warning(
+            "Both train.csv and validation.csv are required to prepare the "
+            "cleaned training sample and check train-validation overlap."
+        )
+    else:
+        comparison_key = (
+            os.stat(train_path).st_mtime_ns,
+            os.stat(validation_path).st_mtime_ns,
+            os.stat(dataset_path).st_mtime_ns,
+        )
+        if st.button(
+            "Run train vs test comparison",
+            key="run_train_test_comparison",
+        ):
+            try:
+                with st.spinner(
+                    "Preparing reproducible samples and calculating ROUGE. "
+                    "The first run reads the full training CSV."
+                ):
+                    training_sample, cleaned_training_count = (
+                        _load_clean_training_sample(
+                            str(train_path),
+                            str(validation_path),
+                            comparison_key[0],
+                            comparison_key[1],
+                        )
+                    )
+                    test_sample = _load_dataset_sample(
+                        str(dataset_path), comparison_key[2]
+                    )
+                    training_rows, training_evaluated = _evaluate_methods(
+                        tuple(training_sample), summarize, tokenize_sentences
+                    )
+                    test_rows, test_evaluated = _evaluate_methods(
+                        tuple(test_sample), summarize, tokenize_sentences
+                    )
+                st.session_state["train_test_comparison"] = {
+                    "key": comparison_key,
+                    "training_rows": training_rows,
+                    "test_rows": test_rows,
+                    "training_sample_size": len(training_sample),
+                    "test_sample_size": len(test_sample),
+                    "training_evaluated": training_evaluated,
+                    "test_evaluated": test_evaluated,
+                    "cleaned_training_count": cleaned_training_count,
+                }
+            except (OSError, csv.Error, UnicodeError) as error:
+                st.error(f"Could not prepare the train/test comparison: {error}")
+
+        comparison = st.session_state.get("train_test_comparison")
+        if comparison and comparison.get("key") == comparison_key:
+            if comparison["training_evaluated"] and comparison["test_evaluated"]:
+                _render_split_comparison(
+                    comparison["training_rows"],
+                    comparison["test_rows"],
+                    comparison["training_sample_size"],
+                    comparison["test_sample_size"],
+                    comparison["training_evaluated"],
+                    comparison["test_evaluated"],
+                    comparison["cleaned_training_count"],
+                )
+            else:
+                st.warning(
+                    "The samples did not contain eligible multi-sentence "
+                    "articles for both splits, so a comparison could not be shown."
+                )
+
     _article_method_comparison(
         current_article, summarize, tokenize_sentences, rouge_rows
     )
@@ -461,5 +725,7 @@ def render_statistics_page(
         "- ROUGE-1, ROUGE-2, and ROUGE-L quantify unigram, bigram, and "
         "longest-common-subsequence overlap with reference summaries.\n"
         "- Comparing mean ROUGE scores on the same held-out examples provides "
-        "a quantitative comparison of the three implemented extractive methods."
+        "a quantitative comparison of the three implemented extractive methods.\n"
+        "- The optional training-vs-test panel evaluates the fixed methods on "
+        "equal-sized samples; it does not train a learned summarization model."
     )
